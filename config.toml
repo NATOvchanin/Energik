@@ -1,0 +1,115 @@
+# ===== НАСТРОЙКИ МИСТЕРА ЭНЕРГИКА =====
+# Всё, что можно крутить, лежит здесь. Код трогать не нужно.
+
+[audio]
+# Часть названия устройства. Пусто = то, что выбрано в Windows по умолчанию.
+# Список устройств: python main.py --devices
+input_device = "USB PnP Audio Devi"
+output_device = "AirPods Max"
+
+[ears]
+# Модель распознавания. large-v3-turbo точнее, но качается ~1.6 ГБ.
+# Если тесно по видеопамяти или не нужна точность: "small"
+whisper_model = "large-v3-turbo"
+device = "cuda"                 # "cuda" (видеокарта) или "cpu"
+compute_type = "int8_float16"   # для cpu автоматически станет int8
+language = "ru"
+vad_threshold = 0.5             # чувствительность к голосу (0.3 чувствительнее, 0.7 строже)
+min_silence_ms = 700            # пауза, после которой фраза считается законченной
+min_speech_ms = 250             # короче этого считаем шумом
+max_phrase_s = 20               # длиннее фразу обрежем
+preroll_ms = 300                # сколько звука захватить до начала речи
+# Если распознанный текст содержит это, выбрасываем (типичные глюки Whisper)
+hallucinations = ["субтитры", "субтитр", "продолжение следует", "спасибо за просмотр", "редактор субтитров", "синецкая", "егорова"]
+
+[voice]
+speaker = "aidar"       # мужские: aidar, eugene; женские: baya, kseniya, xenia
+sample_rate = 24000
+threads = 4             # потоков процессора под голос
+preset = "my_voice"        # clean / soft_robot / tenna / dalek (или свой пресет ниже)
+target_peak = 0.8       # общая громкость (0.1..0.95)
+device = "cuda"
+
+# --- Пресеты роботизации ---
+# pitch_semitones   сдвиг высоты тона (минус = ниже)
+# ring_freq/depth   металлический «далековский» призвук (глубина 0..1, больше = грубее)
+# resample_hz       «цифровая зернистость» (ниже = грубее, 0 = выкл.)
+# comb_ms/feedback/mix   эффект «жестяной трубы»
+# highpass_hz/lowpass_hz срез низов и верхов (lowpass главный защитник ушей)
+# wet               доля обработанного звука (1 = только робот, 0 = чистый голос)
+# stutter_chance    шанс «заедания» на фразу
+
+[voice.presets.clean]
+pitch_semitones = 1.0
+wet = 0.0
+lowpass_hz = 0
+highpass_hz = 0
+stutter_chance = 0.0
+
+[voice.presets.soft_robot]
+pitch_semitones = 2.0
+ring_freq = 70
+ring_depth = 0.15
+resample_hz = 16000
+comb_ms = 6
+comb_feedback = 0.25
+comb_mix = 0.25
+highpass_hz = 100
+lowpass_hz = 6500
+wet = 0.7
+stutter_chance = 0.0
+
+[voice.presets.tenna]
+pitch_semitones = 3.0
+ring_freq = 90
+ring_depth = 0.2
+resample_hz = 11025
+comb_ms = 4
+comb_feedback = 0.35
+comb_mix = 0.3
+highpass_hz = 110
+lowpass_hz = 6000
+wet = 0.65
+stutter_chance = 0.12
+
+[voice.presets.dalek]
+pitch_semitones = 5.0
+ring_freq = 30
+ring_depth = 0.55
+resample_hz = 8000
+comb_ms = 3
+comb_feedback = 0.5
+comb_mix = 0.4
+highpass_hz = 120
+lowpass_hz = 5000
+wet = 0.85
+stutter_chance = 0.05
+
+[voice.presets.my_voice]
+pitch_semitones = 2
+ring_freq = 85
+ring_depth = 0.25
+resample_hz = 11000
+comb_ms = 5
+comb_feedback = 0.5
+comb_mix = 0.3
+highpass_hz = 200
+lowpass_hz = 5000
+wet = 0.85
+stutter_chance = 0.50
+speed = 1.08            # скорость речи: 1.0 как есть, 1.08 чуть быстрее, 1.15 заметно быстрее
+tail_ms = 400           # тишина в конце фразы: защита от обрезания последнего слова
+
+[brain]
+model = "gemma4:e4b"
+num_ctx = 2048
+temperature = 0.8
+max_tokens = 120
+history_turns = 8
+keep_alive = "30m"
+persona_file = "persona.txt"
+max_sentences = 3        # НОВАЯ строка: больше трёх предложений за раз он не скажет
+search = true # поиск в интернете (необязательный: без сети Энергик просто скажет, что не вышло)
+search_timeout = 7        # сколько секунд ждать поиск, потом Энергик скажет «не вышло»
+search_backend = "auto"   # движок поиска; подобрать быстрый можно командой: python tools.py "любой запрос"
+

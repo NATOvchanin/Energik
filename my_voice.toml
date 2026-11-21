@@ -1,0 +1,15 @@
+# speaker = "aidar"  (впиши в [voice] в config.toml)
+[voice.presets.my_voice]
+pitch_semitones = 2
+ring_freq = 85
+ring_depth = 0.25
+resample_hz = 11000
+comb_ms = 5
+comb_feedback = 0.5
+comb_mix = 0.3
+highpass_hz = 200
+lowpass_hz = 5000
+wet = 0.85
+stutter_chance = 0.75
+
+# target_peak = 0.8  (впиши в [voice] в config.toml)
