@@ -1,27 +1,26 @@
-"""Мозг Энергика: языковая модель в Ollama, потоковый ответ по предложениям."""
+"""
+Мозг Энергика: диалог + любопытство (сам идёт в сеть) + долговременная память.
+Языковая модель получает уже подготовленный контекст; поиск, память и записи делает программа.
+"""
 import random
 import re
+import threading
 import time
 
-import ollama
-
+import curiosity
+import memory as memlib
 import tools
 from config import ROOT
 
 SENT_END = re.compile(r'[.!?…]+["»)]*\s')
 SOFT_BREAKS = (", ", " — ", "; ", ": ")
 WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
-FILLERS = ["Сек, гляну в сети.", "Ща проверю.", "Погоди, полезу в интернет.", "Так, ищу."]
+FILLERS = ["Сек, гляну.", "Ща проверю.", "Погоди, выясню.", "Так, дай-ка загляну в сеть."]
 CJK_RE = re.compile(r"[\u2e80-\u9fff\uac00-\ud7af\uff00-\uffef]+")  # иероглифы-глюки модели
 
 
-def split_stream(chunks, soft_limit: int = 110, first_limit: int = 55,
-                 truncated=lambda: False):
-    """
-    Превращает поток кусочков текста в поток предложений.
-    Слишком длинное предложение режется по запятой, чтобы озвучка стартовала быстрее.
-    Если ответ оборвался по лимиту токенов, недописанный хвост выбрасывается.
-    """
+def split_stream(chunks, soft_limit: int = 110, first_limit: int = 55, truncated=lambda: False):
+    """Поток кусочков текста -> поток предложений. Длинное режется по запятой, обрыв по лимиту выбрасывается."""
     buf = ""
     emitted = 0
     for ch in chunks:
@@ -48,73 +47,71 @@ def split_stream(chunks, soft_limit: int = 110, first_limit: int = 55,
         yield tail
 
 
-def _field(obj, name):
-    try:
-        return obj[name]
-    except Exception:
-        return getattr(obj, name, None)
-
-
 class Brain:
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, dialogue, utility, mem: memlib.Memory):
         b = cfg["brain"]
-        self.model = b["model"]
-        self.opts = {"num_ctx": int(b["num_ctx"]),
-                     "temperature": float(b["temperature"]),
-                     "num_predict": int(b["max_tokens"])}
-        self.keep_alive = b["keep_alive"]
+        self.cfg = cfg
+        self.llm, self.util, self.mem = dialogue, utility, mem
+        self.temperature = float(b.get("temperature", 0.8))
+        self.max_tokens = int(b["max_tokens"])
         self.max_turns = int(b["history_turns"])
         self.max_sentences = int(b.get("max_sentences", 3))
         self.search_on = bool(b.get("search", True))
-        self.search_timeout = float(b.get("search_timeout", 7))
-        self.search_backend = b.get("search_backend", "auto")
-        self.last_search = None  # (номер реплики, запрос, найденное)
+        self.curious = bool(b.get("curiosity", True)) and self.search_on
+        self.memory_every = int(b.get("memory_every_turns", 8))
+        self.news_feeds = b.get("news_feeds", ["https://lenta.ru/rss/news", "https://www.interfax.ru/rss.asp",
+                                               "https://tass.ru/rss/v2.xml"])
         self.persona = (ROOT / b["persona_file"]).read_text(encoding="utf-8").strip()
         self.history: list[dict] = []
-        self._truncated = False
+        self.transcript: list[str] = []      # строки для дневника памяти
+        self._digested = 0                   # сколько строк transcript уже ушло в память
+        self._digest_thread: threading.Thread | None = None
+        self.last_search = None              # (номер реплики, запрос, найденное)
+        self.news = None
         self.t_start = time.time()
         self.turns = 0
-        self._check_model()
 
-    def _check_model(self) -> None:
-        try:
-            models = ollama.list()["models"]
-            names = [(m.get("model") or m.get("name") or "") for m in models]
-        except Exception as e:
-            raise SystemExit(f"[МОЗГ] Ollama не отвечает ({e}).\n"
-                             "Запусти программу Ollama (значок в трее) и повтори.")
-        if not any(n == self.model or n.startswith(self.model) for n in names):
-            raise SystemExit(f"[МОЗГ] Модель '{self.model}' не скачана.\n"
-                             f"Выполни:  ollama pull {self.model}\n"
-                             f"Скачано сейчас: {', '.join(names) or 'ничего'}")
-
-    def warmup(self) -> None:
-        print(f"[МОЗГ] Загружаю {self.model} в видеопамять...")
-        t = time.time()
-        for _ in self._chunks([{"role": "user", "content": "Скажи одно слово: готов."}],
-                              max_tokens=5):
-            pass
-        print(f"[МОЗГ] Готов за {time.time() - t:.1f} с")
-
+    # ---------- подготовка контекста ----------
     def reset(self) -> None:
+        """«Забудь всё»: сбрасывает только текущий разговор. Долговременная память остаётся."""
         self.history.clear()
+        self.news = None
+        self.last_search = None
         self.t_start = time.time()
         self.turns = 0
 
-    def _system(self) -> str:
+    def _recall(self, user_text: str) -> str:
+        """Выбирает несколько воспоминаний, подходящих к теме."""
+        query = user_text
+        if len(re.findall(r"\w+", user_text)) < 5:       # короткая реплика: добавим смысл прошлой
+            prev = [m["content"] for m in self.history[:-1] if m["role"] == "user"]
+            if prev:
+                query += " " + prev[-1]
+        core = self.mem.core(3)
+        found = self.mem.search(query, limit=3, exclude={r["id"] for r in core})
+        rows = list(core) + found
+        lines = [f"- ({memlib.ago(r['ts'])}) {r['text']}" for r in rows]
+        if self.turns <= 2:
+            last = self.mem.last_session()
+            if last:
+                lines.append(f"- (прошлый разговор, {memlib.ago(last['ts'])}) {last['text']}")
+        if found:
+            self.mem.touch([r["id"] for r in found])
+            print("[ПАМЯТЬ] вспомнил: " + " | ".join(r["text"][:50] for r in found))
+        if not lines:
+            return ""
+        return ("\nЧто ты помнишь о Боссе и ваших разговорах (вставляй к месту одной короткой отсылкой, "
+                "не пересказывай списком и не добавляй деталей, которых здесь нет):\n" + "\n".join(lines))
+
+    def _system(self, user_text: str = "") -> str:
         minutes = int((time.time() - self.t_start) / 60)
         dur = "меньше минуты" if minutes < 1 else f"{minutes} мин."
         now = time.localtime()
-        caps = ("Что у тебя реально есть: слух (микрофон), голос и память на текущий сеанс. "
-                "Экран ты пока не видишь. ")
-        if self.search_on:
-            caps += ("Поиск в интернете запускается, когда Босс говорит «загугли ...», "
-                     "«найди в интернете ...», «кто такой ...» или просит новости. Результаты приходят "
-                     "в блоке «Результаты поиска». Если такого блока нет, значит ты ничего не искал "
-                     "и не открывал: не говори, что смотрел страницы или нашёл что-то, а подскажи "
-                     "Боссу сказать «загугли». ")
-        else:
-            caps += "Доступа в интернет у тебя сейчас нет. "
+        caps = ("Что у тебя реально есть: слух (микрофон), голос, память и умение сходить в интернет, "
+                "когда это нужно. Экран ты пока не видишь. Если для ответа нужно было что-то выяснить, "
+                "это делается до твоего ответа и приходит блоком «Результаты поиска». Если такого блока "
+                "нет, значит ты ничего не искал и не открывал: не говори, что смотрел страницы, и "
+                "не выдумывай факты, а честно скажи, что не знаешь. ")
         recent = ""
         if self.last_search and 0 < self.turns - self.last_search[0] <= 4:
             _, q, found = self.last_search
@@ -125,67 +122,93 @@ class Brain:
                 f"Сегодня: {time.strftime('%d.%m.%Y', now)}, {WEEKDAYS[now.tm_wday]}, "
                 f"время {time.strftime('%H:%M', now)}.\n"
                 f"Факты о сеансе: вы с Боссом разговариваете {dur}, реплик Босса: {self.turns}. "
-                "Других цифр о времени и истории не придумывай.\n" + caps +
-                "Не заявляй о возможностях, которых нет в этом списке." + recent)
+                "Других цифр о времени и истории не придумывай.\n" + caps + recent +
+                self._recall(user_text))
 
-    def _chunks(self, messages, max_tokens=None):
-        opts = dict(self.opts)
-        if max_tokens:
-            opts["num_predict"] = max_tokens
-        kw = dict(model=self.model, messages=messages, stream=True,
-                  options=opts, keep_alive=self.keep_alive)
-        self._truncated = False
-        for try_think_off in (True, False):
-            args = dict(kw, think=False) if try_think_off else kw
-            started = False
-            try:
-                for part in ollama.chat(**args):
-                    msg = _field(part, "message")
-                    piece = _field(msg, "content") if msg is not None else ""
-                    if piece:
-                        started = True
-                        yield piece
-                    if _field(part, "done_reason") == "length":
-                        self._truncated = True
-                return
-            except (TypeError, ollama.ResponseError) as e:
-                if try_think_off and not started and ("think" in str(e).lower()
-                                                      or isinstance(e, TypeError)):
-                    continue
-                raise
+    # ---------- любопытство ----------
+    def _intent(self, user_text: str):
+        """Что нужно выяснить перед ответом: (вид, запрос, откуда решение) или None."""
+        if not self.search_on:
+            return None
+        if self.news and self.turns - self.news["turn"] <= 3 and tools.is_more_request(user_text):
+            return "news", "новости", "продолжение"
+        req = tools.parse_search_request(user_text)
+        if req:
+            return req[0], req[1], "прямая просьба"
+        if self.curious:
+            t = time.time()
+            d = curiosity.decide(self.util, user_text, self.history[:-1])
+            if d:
+                print(f"[ЛЮБОПЫТСТВО] сам решил выяснить ({time.time() - t:.1f} с): {d[0]} «{d[1]}»")
+                return d[0], d[1], "само"
+        return None
 
+    def _news_cached(self, query: str) -> bool:
+        n = self.news
+        return bool(query == "новости" and n and time.time() - n["ts"] <= 600 and n["pos"] < len(n["items"]))
+
+    def _next_news(self):
+        n = self.news
+        if not self._news_cached("новости"):
+            items, err = tools.fetch_news(self.news_feeds)
+            if not items:
+                return None, err
+            n = self.news = {"items": items, "pos": 0, "ts": time.time(), "turn": self.turns}
+        it = n["items"][n["pos"]]
+        n["pos"] += 1
+        n["turn"] = self.turns
+        date = f" ({it['date']})" if it["date"] else ""
+        return f"[{it['source']}]{date} {it['title']}. {it['summary']}"[:700], None
+
+    def _lookup(self, kind: str, query: str, question: str):
+        if kind == "news" and query == "новости":
+            found, err = self._next_news()
+            if found:
+                return found, None
+            print(f"[ИНТЕРНЕТ] ленты недоступны ({err}), пробую поисковик")
+            kind = "search"
+        return curiosity.research(self.util, "who" if kind == "who" else "search", query,
+                                  question, self.cfg)
+
+    # ---------- ответ ----------
     def reply(self, user_text: str):
         """Генератор: выдаёт ответ по одному предложению, не больше max_sentences."""
         self.turns += 1
         self.history.append({"role": "user", "content": user_text})
 
         note = ""
-        req = tools.parse_search_request(user_text) if self.search_on else None
-        if req:
-            kind, query = req
-            yield random.choice(FILLERS)  # пока ищем, не молчим (в историю не попадает)
-            print(f"[ИНТЕРНЕТ] ищу ({'новости' if kind == 'news' else 'текст'}): {query}")
+        intent = self._intent(user_text)
+        if intent:
+            kind, query, why = intent
+            if not (kind == "news" and self._news_cached(query)):
+                yield random.choice(FILLERS)  # пока выясняем, не молчим (в историю не попадает)
+            print(f"[ИНТЕРНЕТ] ({why}) {kind}: {query}")
             t = time.time()
-            found, err = tools.web_search(query, kind=kind, timeout=self.search_timeout,
-                                          backend=self.search_backend)
+            found, err = self._lookup(kind, query, user_text)
             if found:
-                print(f"[ИНТЕРНЕТ] нашёл за {time.time() - t:.1f} с")
-                self.last_search = (self.turns, query, found)
-                note = (f"\n\n[Результаты поиска в интернете по запросу «{query}»:\n{found}\n"
-                        "Правила: опирайся только на эти результаты, числа и названия бери дословно, "
-                        "источники называй только из квадратных скобок. Если нужного в выдержках нет, "
-                        "так и скажи. Первое предложение по делу, второе короткий подкол.]")
+                print(f"[ИНТЕРНЕТ] готово за {time.time() - t:.1f} с")
+                self.last_search = (self.turns, "новость" if query == "новости" else query, found)
+                if kind == "news" and query == "новости":
+                    note = (f"\n\n[Одна свежая новость: {found}\nПерескажи её своими словами в одном "
+                            "коротком предложении, ничего не добавляя от себя, затем короткий подкол. "
+                            "Источник называй только из квадратных скобок.]")
+                else:
+                    note = (f"\n\n[Результаты поиска по запросу «{query}»:\n{found}\n"
+                            "Правила: опирайся только на эти результаты, числа и названия бери дословно, "
+                            "источники называй только из квадратных скобок. Если нужного в них нет, "
+                            "так и скажи. Первое предложение по делу, второе короткий подкол.]")
             else:
                 print(f"[ИНТЕРНЕТ] не вышло за {time.time() - t:.1f} с: {err}")
-                note = (f"\n\n[Поиск в интернете не удался ({err}). Скажи Боссу об этом коротко "
-                        "и с издёвкой, ничего не выдумывай.]")
+                note = (f"\n\n[Выяснить не удалось ({err}). Скажи Боссу об этом коротко и с издёвкой, "
+                        "ничего не выдумывай.]")
 
         hist = self.history[-self.max_turns * 2:]
-        messages = ([{"role": "system", "content": self._system()}] + hist[:-1] +
+        messages = ([{"role": "system", "content": self._system(user_text)}] + hist[:-1] +
                     [{"role": "user", "content": user_text + note}])
         spoken: list[str] = []
-        real = 0  # считаем только законченные предложения, а не куски, нарезанные по запятой
-        stream = split_stream(self._chunks(messages), truncated=lambda: self._truncated)
+        real = 0
+        stream = split_stream(self.llm.stream(messages, self.temperature, self.max_tokens),
+                              truncated=lambda: self.llm.truncated)
         try:
             for sentence in stream:
                 sentence = CJK_RE.sub("", sentence).strip()
@@ -196,10 +219,54 @@ class Brain:
                 if sentence[-1] in '.!?…"»)':
                     real += 1
                 if real >= self.max_sentences:
-                    break  # остальное модель договорит в пустоту, мы это обрываем
+                    break
         finally:
             stream.close()
             answer = " ".join(spoken).strip()
             if answer:  # в историю идёт только то, что реально прозвучало
                 self.history.append({"role": "assistant", "content": answer})
             self.history[:] = self.history[-self.max_turns * 2:]
+            self.transcript.append(f"Босс: {user_text}")
+            self.transcript.append(f"Энергик: {answer or '(промолчал)'}")
+            self._maybe_digest()
+
+    # ---------- приветствие и память ----------
+    def greeting(self):
+        """Приветствие с отсылкой к прошлому разговору. None, если Энергик пока ничего не помнит."""
+        if self.mem.count() == 0:
+            return None
+        sys_prompt = self.persona + self._recall("") + "\n\nФормат: одно-два коротких предложения вслух по-русски."
+        try:
+            text = self.llm.complete(
+                [{"role": "system", "content": sys_prompt},
+                 {"role": "user", "content": "[Босс только что включил программу. Поздоровайся с ним. "
+                                             "Если уместно, коротко отсылайся к прошлому разговору "
+                                             "или к тому, что ты о нём помнишь.]"}],
+                temperature=0.9, max_tokens=80)
+        except Exception as e:
+            print(f"[МОЗГ] приветствие не вышло: {e}")
+            return None
+        return CJK_RE.sub("", text).strip() or None
+
+    def _maybe_digest(self) -> None:
+        pending = len(self.transcript) - self._digested
+        if pending < self.memory_every * 2:
+            return
+        if self._digest_thread and self._digest_thread.is_alive():
+            return
+        lines = self.transcript[self._digested:]
+        self._digested = len(self.transcript)
+        self._digest_thread = threading.Thread(
+            target=memlib.digest, args=(self.util, self.mem, lines), daemon=True)
+        self._digest_thread.start()
+
+    def close(self) -> None:
+        """Перед выходом: дописывает дневник и итог разговора."""
+        if self._digest_thread and self._digest_thread.is_alive():
+            self._digest_thread.join(timeout=30)
+        lines = self.transcript[self._digested:]
+        if self.turns >= 2:
+            print("[ПАМЯТЬ] записываю итоги разговора...")
+            summary_source = lines if len(lines) >= 4 else self.transcript[-12:]
+            memlib.digest(self.util, self.mem, summary_source, with_summary=True)
+            self._digested = len(self.transcript)

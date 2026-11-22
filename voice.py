@@ -70,8 +70,8 @@ class Voice:
         self.preset_name = v["preset"]
         self.out_dev = devices.find(cfg["audio"]["output_device"], "output")
         self.rng = np.random.default_rng()
-        self.speed = float(v.get("speed", 1.0))      # 1.0 = как есть, 1.08 = чуть быстрее
-        self.tail_s = float(v.get("tail_ms", 400)) / 1000
+        self.speed = float(v.get("speed", self.presets.get(self.preset_name, {}).get("speed", 1.0)))      # 1.0 = как есть, 1.08 = чуть быстрее
+        self.tail_s = float(v.get("tail_ms", self.presets.get(self.preset_name, {}).get("tail_ms", 400))) / 1000
         self._stream = None
 
         torch.set_num_threads(int(v.get("threads", 3)))

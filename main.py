@@ -1,5 +1,5 @@
 """
-Мистер Энергик. ЭТАП 2: мозг и характер.
+Мистер Энергик. ЭТАП 3: любопытство и память.
 Ты говоришь, он думает (Ollama) и отвечает в образе, озвучка идёт по предложениям.
 
 Запуск:  python main.py
@@ -43,20 +43,26 @@ def main() -> None:
         profile = sys.argv[sys.argv.index("--profile") + 1]
         print(f"[ПРОФИЛЬ] {profile}")
     cfg = config.load(profile)
+    import llm
     from brain import Brain
     from ears import Ears
+    from memory import Memory
     from speaker import Speaker
     from voice import Voice
 
-    brain = Brain(cfg)          # сначала проверка Ollama и модели, чтобы падать рано
+    dialogue, utility = llm.make(cfg)   # сначала проверка модели, чтобы падать рано
+    mem = Memory()
+    brain = Brain(cfg, dialogue, utility, mem)
     voice = Voice(cfg)
     speaker = Speaker(voice)
     ears = Ears(cfg)
-    brain.warmup()
+    dialogue.warmup()
+    print(f"[ПАМЯТЬ] заметок в памяти: {mem.count()}")
     print(f"\n[ВИДЕОПАМЯТЬ] занято: {gpu_memory()}")
     print("[СОВЕТ] В другой консоли выполни `ollama ps`: в колонке PROCESSOR должно быть 100% GPU.\n")
 
-    speaker.say("Босс, Энергик на связи. Что у нас сегодня, очередной провал?")
+    hello = brain.greeting() or "Босс, Энергик на связи. Что у нас сегодня, очередной провал?"
+    speaker.say(hello)
     speaker.wait_done()
     ears.flush()
 
@@ -75,7 +81,7 @@ def main() -> None:
                 break
             if low in RESET_WORDS:
                 brain.reset()
-                speaker.say("Память стёрта. Кто ты вообще такой?")
+                speaker.say("Разговор сбросил. Но тебя я всё равно помню, Босс.")
                 speaker.wait_done()
                 ears.flush()
                 continue
@@ -100,6 +106,10 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\nВыход.")
     finally:
+        try:
+            brain.close()          # дописать дневник и итог разговора в память
+        except Exception as e:
+            print(f"[ПАМЯТЬ] не удалось сохранить итоги: {e}")
         voice.close()
 
 
