@@ -1,7 +1,9 @@
 """Инструменты Энергика: поиск в интернете (необязательный, без сети он просто не работает)."""
 import html
 import json
+import queue
 import re
+import ssl
 import threading
 import time
 import urllib.parse
@@ -24,6 +26,10 @@ MORE_RE = re.compile(r"^\W*(?:ну\s+|а\s+|давай\s+)?(?:ещё|еще|да
 MORE_ANY_RE = re.compile(r"то\s+же\s+самое|ещё\s+одну|еще\s+одну|следующую|давай\s+дальше", re.I)
 NEWS_RE = re.compile(r"новост\w*", re.I)
 LEAD_RE = re.compile(r"^(?:мне|пожалуйста|ка|ну|там|что-нибудь|что-то|про|о|об)\s+", re.I)
+PREPS = {"по", "в", "во", "о", "об", "про", "на", "из", "для", "у", "к", "с", "со", "за", "от"}
+WHATS_NEW_RE = re.compile(r"\bчто\s+нового\s+(?:в|во|по|про|на)\s+", re.I)
+FIND_IMP_RE = re.compile(r"\b(?:найди|найдите|поищи|поищите)\b", re.I)
+NOT_TOPIC = {"тебя", "тебе", "меня", "мне", "нас", "вас", "него", "неё", "них", "жизни", "дома", "мире"}
 STOP_WORD_RE = re.compile(r"^(?:и|а|но|или|да)$|^(?:" + _VERBS + r")$", re.I)
 
 
@@ -33,15 +39,44 @@ def is_more_request(text: str) -> bool:
     return len(s) < 45 and bool(MORE_RE.match(s) or MORE_ANY_RE.search(s))
 
 
+def _after(text: str) -> str:
+    """Первое предложение из хвоста реплики, без знаков по краям."""
+    rest = re.split(r"[.!?…]", text)[0]
+    return re.sub(r"\s+", " ", rest).strip(" ,;:-—")
+
+
+def _news_query(words: list) -> str:
+    """«новости» + уточнение без предлогов в начале: «по разработке игр» -> «новости разработке игр»."""
+    words = [w.strip(",.;:") for w in words]
+    while words and words[0].lower() in PREPS:
+        words.pop(0)
+    cut = []
+    for w in words[:4]:
+        if STOP_WORD_RE.match(w):
+            break
+        cut.append(w)
+    return " ".join(["новости"] + cut)
+
+
 def parse_search_request(text: str):
     """
     Возвращает (вид, запрос): вид 'news' (новости), 'who' («кто такой») или 'text' (обычный поиск).
     None, если искать не просили.
     """
-    if BARE_NEWS_RE.match(text) or NEWS_ASK_RE.search(text):
+    m_na = NEWS_ASK_RE.search(text)
+    if m_na:                                               # «какие новости по играм?»
+        return "news", _news_query(_after(text[m_na.end():]).split())
+    if BARE_NEWS_RE.match(text):
         return "news", "новости"
+    m_wn = WHATS_NEW_RE.search(text)                       # «что нового в OpenAI?»
+    if m_wn:
+        topic = _after(text[m_wn.end():])
+        if topic and topic.split()[0].lower() not in NOT_TOPIC:
+            return "news", _news_query(topic.split())
+
     m_g, m_who = GOOGLE_RE.search(text), WHO_RE.search(text)
     m_v, m_nv = VERB_RE.search(text), NEWS_VERBS_RE.search(text)
+    m_f = FIND_IMP_RE.search(text)
     kind = "text"
     if m_g:
         start = m_g.end()
@@ -51,24 +86,20 @@ def parse_search_request(text: str):
         start = m_v.end()
     elif m_nv and NEWS_RE.search(text):
         start = m_nv.end()
+    elif m_f:                                              # «найди цену книги ...»
+        start = m_f.end()
     else:
         return None
 
-    rest = re.split(r"[.!?…]", text[start:])[0]          # только первое предложение после команды
-    rest = WHERE_RE.sub(" ", rest)
+    rest = WHERE_RE.sub(" ", _after(text[start:]))
     rest = re.sub(r"\s+", " ", rest).strip(" ,;:-—")
     prev = None
     while prev != rest:                                    # снимаем «мне», «пожалуйста» в начале
         prev, rest = rest, LEAD_RE.sub("", rest).strip()
 
     nm = NEWS_RE.search(rest)
-    if nm:                                                 # новости: слово «новости» + пара уточнений
-        words = []
-        for w in rest[nm.start():].split()[1:5]:
-            if STOP_WORD_RE.match(w.strip(",.;:")):
-                break
-            words.append(w.strip(",.;:"))
-        return "news", " ".join(["новости"] + words)
+    if nm:                                                 # новости: слово «новости» + уточнение
+        return "news", _news_query(rest[nm.start():].split()[1:])
 
     words = rest.split()[:10]
     query = " ".join(w.strip(",;:") for w in words).strip()
@@ -99,30 +130,39 @@ def _search(query: str, kind: str, max_results: int, backend: str):
 
 def search_items(query: str, kind: str = "text", max_results: int = 5, timeout: float = 7.0,
                  backend: str = "auto"):
-    """Возвращает (список результатов, None) или ([], причина). Результат: title, body, href, source, date."""
+    """
+    Возвращает (список результатов, None) или ([], причина). Результат: title, body, href, source, date.
+    Спрашивает сразу два движка (настроенный и bing) и берёт тот, что ответил первым с результатами.
+    """
     query = query.strip()
     if len(query) < 3:
         return [], "запрос слишком короткий"
-    box: dict = {}
+    backends = [backend] if backend == "auto" else list(dict.fromkeys([backend, "bing"]))
+    results: queue.Queue = queue.Queue()
 
-    def work():
+    def work(be: str):
         try:
-            box["items"] = _search(query, kind, max_results, backend)
+            results.put((be, _search(query, kind, max_results, be), None))
         except ImportError:
-            box["err"] = "не установлена библиотека ddgs (pip install ddgs)"
+            results.put((be, [], "не установлена библиотека ddgs (pip install ddgs)"))
         except Exception as e:
-            box["err"] = str(e)[:120] or type(e).__name__
+            results.put((be, [], str(e)[:120] or type(e).__name__))
 
-    th = threading.Thread(target=work, daemon=True)
-    th.start()
-    th.join(timeout)
-    if th.is_alive():
-        return [], f"поиск не ответил за {timeout:.0f} с"
-    if "err" in box:
-        return [], box["err"]
-    items = box.get("items") or []
+    for be in backends:
+        threading.Thread(target=work, args=(be,), daemon=True).start()
+    deadline = time.time() + timeout
+    items, last_err = [], "ничего не найдено"
+    for _ in backends:
+        try:
+            be, got, err = results.get(timeout=max(0.1, deadline - time.time()))
+        except queue.Empty:
+            return [], f"поиск не ответил за {timeout:.0f} с"
+        if got:
+            items = got
+            break
+        last_err = err or last_err
     if not items:
-        return [], "ничего не найдено"
+        return [], last_err
     out = []
     for r in items:
         href = r.get("href") or r.get("url") or ""
@@ -158,9 +198,34 @@ def web_search(query: str, kind: str = "text", max_results: int = 4, max_chars: 
 _UA = {"User-Agent": "Mozilla/5.0 (Energik voice assistant)"}
 
 
+def _safe_url(url: str) -> str:
+    """Кириллица в адресах ломает urllib («'ascii' codec can't encode»): кодируем как положено."""
+    p = urllib.parse.urlsplit(url)
+    host = p.netloc
+    if any(ord(c) > 127 for c in host):
+        host = host.encode("idna").decode("ascii")
+    path = urllib.parse.quote(p.path, safe="/%:@!$&'()*+,;=~-._")
+    query = urllib.parse.quote(p.query, safe="=&%+:/?,;@!$'()*~-._")
+    return urllib.parse.urlunsplit((p.scheme, host, path, query, ""))
+
+
+def _open(url: str, timeout: float, limit: int = 500_000):
+    """Возвращает (байты, кодировка). Если у сайта нет доверенного сертификата (часто у российских
+    сайтов), читаем без проверки: мы только забираем публичный текст и ничего не отправляем."""
+    req = urllib.request.Request(_safe_url(url), headers=_UA)
+    try:
+        r = urllib.request.urlopen(req, timeout=timeout)
+    except Exception as e:
+        reason = str(getattr(e, "reason", e))
+        if "CERTIFICATE_VERIFY_FAILED" not in reason and "certificate" not in reason.lower():
+            raise
+        r = urllib.request.urlopen(req, timeout=timeout, context=ssl._create_unverified_context())
+    with r:
+        return r.read(limit), (r.headers.get_content_charset() or "utf-8")
+
+
 def _get(url: str, timeout: float = 6) -> bytes:
-    with urllib.request.urlopen(urllib.request.Request(url, headers=_UA), timeout=timeout) as r:
-        return r.read()
+    return _open(url, timeout)[0]
 
 
 def wiki_summary(query: str, lang: str = "ru", timeout: float = 6, max_chars: int = 700):  # max_chars до 1200
@@ -263,10 +328,7 @@ def html_to_text(raw_html: str, max_chars: int = 3500) -> str:
 def fetch_page_text(url: str, timeout: float = 6, max_chars: int = 3500):
     """Скачивает страницу и вытаскивает основной текст. Возвращает (текст, None) или (None, причина)."""
     try:
-        req = urllib.request.Request(url, headers=_UA)
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            raw = r.read(500_000)
-            charset = r.headers.get_content_charset() or "utf-8"
+        raw, charset = _open(url, timeout)
     except Exception as e:
         return None, str(e)[:80] or type(e).__name__
     try:

@@ -1,5 +1,6 @@
 """Уши Энергика: микрофон -> детектор речи (Silero VAD) -> Whisper -> текст."""
 import queue
+import re
 import time
 from collections import deque
 
@@ -14,6 +15,28 @@ CHUNK = 512  # Silero VAD требует ровно 512 отсчётов при 
 CHUNK_MS = CHUNK * 1000 / SR
 
 
+# Слова, на которых люди обычно не заканчивают мысль: после них стоит подождать продолжения.
+OPEN_WORDS = {"и", "а", "но", "или", "что", "чтобы", "потому", "если", "когда", "как", "типа", "ну",
+              "вот", "это", "то", "в", "на", "с", "по", "для", "про", "у", "к", "о", "от", "из", "за",
+              "я", "мы", "ты", "он", "она", "мне", "тебе", "меня", "не", "ни", "же", "бы", "ли", "так",
+              "ещё", "еще", "вообще", "короче", "значит", "например", "просто", "блин", "чё", "че"}
+
+
+def patience_for(text, patience_ms: int, soft_ms: int) -> int:
+    """Сколько ещё подождать тишины, прежде чем считать мысль законченной (0 = можно отвечать)."""
+    if not text:
+        return 0
+    t = text.strip()
+    if t.endswith(("...", "…", ",", ":", ";", "-", "—")):
+        return patience_ms                      # явно оборвано на полуслове
+    if t.endswith((".", "!", "?")):
+        return 0                                # законченное предложение
+    words = re.findall(r"[\w'-]+", t.lower())
+    if words and words[-1] in OPEN_WORDS:
+        return patience_ms                      # «...и», «...потому что»
+    return soft_ms                              # знаков нет: чуть подождём
+
+
 class Ears:
     def __init__(self, cfg: dict):
         e = cfg["ears"]
@@ -26,6 +49,8 @@ class Ears:
         self.pre_chunks = int(e["preroll_ms"] / CHUNK_MS)
         self.halluc = [h.lower() for h in e["hallucinations"]]
         self.last_asr_s = 0.0
+        self.patience_ms = int(e.get("patience_ms", 1500))
+        self.patience_soft_ms = int(e.get("patience_soft_ms", 600))
 
         print("[УШИ] Загружаю детектор речи...")
         from silero_vad import load_silero_vad
@@ -76,12 +101,17 @@ class Ears:
 
     # ---------- главный метод ----------
     def listen(self) -> str | None:
-        """Ждёт фразу, возвращает текст. None = шум/пустота/галлюцинация."""
+        """
+        Ждёт фразу, возвращает текст. None = шум/пустота/галлюцинация.
+        Конец фразы определяется в два шага: пауза 0.7 с -> быстро распознаём -> если мысль закончена
+        (точка, вопрос), отвечаем сразу; если оборвана («...и», запятая), ждём ещё и дослушиваем.
+        """
         preroll = deque(maxlen=self.pre_chunks)
         speech: list[np.ndarray] = []
         in_speech = False
         voiced = 0
         silence = 0
+        pending = None            # (текст, во сколько чанков тишины закончить ожидание)
         self.vad.reset_states()
 
         while True:
@@ -95,21 +125,36 @@ class Ears:
                     speech = list(preroll)
                     voiced = 1
                     silence = 0
+                continue
+
+            speech.append(chunk)
+            if prob >= self.thr:
+                voiced += 1
+                silence = 0
+                pending = None        # человек продолжил говорить
             else:
-                speech.append(chunk)
-                if prob >= self.thr:
-                    voiced += 1
-                    silence = 0
-                else:
-                    silence += 1
-                if silence >= self.sil_chunks or len(speech) >= self.max_chunks:
-                    break
+                silence += 1
+            if len(speech) >= self.max_chunks:
+                break
+            if silence >= self.sil_chunks:
+                if voiced < self.min_speech_chunks:
+                    return None
+                if pending is None:
+                    t0 = time.time()
+                    text = self._transcribe(np.concatenate(speech))
+                    self.last_asr_s = time.time() - t0
+                    wait_ms = patience_for(text, self.patience_ms, self.patience_soft_ms)
+                    if wait_ms == 0:
+                        return text
+                    print(f"   (мысль не закончена, жду продолжения: «...{text[-25:]}»)")
+                    pending = (text, silence + int(wait_ms / CHUNK_MS))
+                elif silence >= pending[1]:
+                    return pending[0]
 
         if voiced < self.min_speech_chunks:
             return None
-        audio = np.concatenate(speech)
         t0 = time.time()
-        text = self._transcribe(audio)
+        text = self._transcribe(np.concatenate(speech))
         self.last_asr_s = time.time() - t0
         return text
 

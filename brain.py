@@ -54,6 +54,7 @@ class Brain:
         self.llm, self.util, self.mem = dialogue, utility, mem
         self.temperature = float(b.get("temperature", 0.8))
         self.max_tokens = int(b["max_tokens"])
+        self.num_ctx = int(b["num_ctx"])
         self.max_turns = int(b["history_turns"])
         self.max_sentences = int(b.get("max_sentences", 3))
         self.search_on = bool(b.get("search", True))
@@ -67,6 +68,10 @@ class Brain:
         self._digested = 0                   # сколько строк transcript уже ушло в память
         self._digest_thread: threading.Thread | None = None
         self.last_search = None              # (номер реплики, запрос, найденное)
+        self.summary = ""                    # краткое содержание начала длинного разговора
+        self._compressing = False
+        self._fit_used = 0                   # сколько реплик истории влезло в последний запрос
+        self._core_turn = -99                # когда последний раз показывали «главное о Боссе»
         self.news = None
         self.t_start = time.time()
         self.turns = 0
@@ -75,33 +80,39 @@ class Brain:
     def reset(self) -> None:
         """«Забудь всё»: сбрасывает только текущий разговор. Долговременная память остаётся."""
         self.history.clear()
+        self.summary = ""
         self.news = None
         self.last_search = None
         self.t_start = time.time()
         self.turns = 0
 
     def _recall(self, user_text: str) -> str:
-        """Выбирает несколько воспоминаний, подходящих к теме."""
+        """Выбирает воспоминания. Главное о Боссе показываем раз в несколько реплик, остальное только
+        если оно правда подходит к теме (и не то, что только что вспоминали)."""
         query = user_text
         if len(re.findall(r"\w+", user_text)) < 5:       # короткая реплика: добавим смысл прошлой
             prev = [m["content"] for m in self.history[:-1] if m["role"] == "user"]
             if prev:
                 query += " " + prev[-1]
-        core = self.mem.core(3)
-        found = self.mem.search(query, limit=3, exclude={r["id"] for r in core})
-        rows = list(core) + found
+        core = []
+        if self.turns == 1 or self.turns - self._core_turn >= 6:
+            core = list(self.mem.core(3))
+            self._core_turn = self.turns
+        found = self.mem.search(query, limit=2, exclude={r["id"] for r in core})
+        rows = core + list(found)
         lines = [f"- ({memlib.ago(r['ts'])}) {r['text']}" for r in rows]
         if self.turns <= 2:
             last = self.mem.last_session()
             if last:
                 lines.append(f"- (прошлый разговор, {memlib.ago(last['ts'])}) {last['text']}")
-        if found:
-            self.mem.touch([r["id"] for r in found])
-            print("[ПАМЯТЬ] вспомнил: " + " | ".join(r["text"][:50] for r in found))
+        if rows:
+            self.mem.touch([r["id"] for r in rows])
+            print("[ПАМЯТЬ] вспомнил: " + " | ".join(r["text"][:50] for r in rows))
         if not lines:
             return ""
-        return ("\nЧто ты помнишь о Боссе и ваших разговорах (вставляй к месту одной короткой отсылкой, "
-                "не пересказывай списком и не добавляй деталей, которых здесь нет):\n" + "\n".join(lines))
+        return ("\nЧто ты помнишь о Боссе и ваших разговорах. Упоминай это редко, не чаще раза в пять реплик "
+                "и только если правда к теме, одной короткой отсылкой. Не пересказывай списком, не "
+                "добавляй деталей, которых здесь нет:\n" + "\n".join(lines))
 
     def _system(self, user_text: str = "") -> str:
         minutes = int((time.time() - self.t_start) / 60)
@@ -118,11 +129,13 @@ class Brain:
             recent = (f"\nНедавний поиск (запрос «{q}»), если Босс спросит про него, опирайся на это, "
                       f"числа и названия бери дословно, источники называй только из квадратных скобок:\n"
                       f"{found[:700]}")
+        earlier = (f"\nКратко о начале этого разговора (уже не в истории): {self.summary}"
+                   if self.summary else "")
         return (self.persona + "\n\n"
                 f"Сегодня: {time.strftime('%d.%m.%Y', now)}, {WEEKDAYS[now.tm_wday]}, "
                 f"время {time.strftime('%H:%M', now)}.\n"
                 f"Факты о сеансе: вы с Боссом разговариваете {dur}, реплик Босса: {self.turns}. "
-                "Других цифр о времени и истории не придумывай.\n" + caps + recent +
+                "Других цифр о времени и истории не придумывай.\n" + caps + recent + earlier +
                 self._recall(user_text))
 
     # ---------- любопытство ----------
@@ -191,20 +204,32 @@ class Brain:
                 if kind == "news" and query == "новости":
                     note = (f"\n\n[Одна свежая новость: {found}\nПерескажи её своими словами в одном "
                             "коротком предложении, ничего не добавляя от себя, затем короткий подкол. "
-                            "Источник называй только из квадратных скобок.]")
+                            "Если называешь источник, то по-человечески и без адреса (не «lenta.ru», а «Лента»).]")
                 else:
                     note = (f"\n\n[Результаты поиска по запросу «{query}»:\n{found}\n"
                             "Правила: опирайся только на эти результаты, числа и названия бери дословно, "
-                            "источники называй только из квадратных скобок. Если нужного в них нет, "
-                            "так и скажи. Первое предложение по делу, второе короткий подкол.]")
+                            "источник, если называешь, то по-человечески и без адреса (не «wciom.ru», а «ВЦИОМ»). "
+                            "Если нужного в них нет, так и скажи. Первое предложение по делу, второе короткий подкол.]")
             else:
                 print(f"[ИНТЕРНЕТ] не вышло за {time.time() - t:.1f} с: {err}")
                 note = (f"\n\n[Выяснить не удалось ({err}). Скажи Боссу об этом коротко и с издёвкой, "
                         "ничего не выдумывай.]")
 
-        hist = self.history[-self.max_turns * 2:]
-        messages = ([{"role": "system", "content": self._system(user_text)}] + hist[:-1] +
-                    [{"role": "user", "content": user_text + note}])
+        system = self._system(user_text)
+        user_msg = user_text + note
+        # Историю подбираем под размер контекста модели: свежие реплики целиком, пока есть место
+        # (иначе Ollama молча выбросила бы начало запроса). Оценка: ~2.2 символа на токен.
+        budget = self.num_ctx - self.max_tokens - 150 - self._tok(system) - self._tok(user_msg)
+        hist: list[dict] = []
+        for m in reversed(self.history[:-1][-(self.max_turns * 2):]):
+            cost = self._tok(m["content"]) + 6
+            if cost > budget:
+                break
+            budget -= cost
+            hist.insert(0, m)
+        self._fit_used = len(hist) + 1
+        messages = ([{"role": "system", "content": system}] + hist +
+                    [{"role": "user", "content": user_msg}])
         spoken: list[str] = []
         real = 0
         stream = split_stream(self.llm.stream(messages, self.temperature, self.max_tokens),
@@ -225,10 +250,50 @@ class Brain:
             answer = " ".join(spoken).strip()
             if answer:  # в историю идёт только то, что реально прозвучало
                 self.history.append({"role": "assistant", "content": answer})
-            self.history[:] = self.history[-self.max_turns * 2:]
+            self._maybe_compress()
             self.transcript.append(f"Босс: {user_text}")
             self.transcript.append(f"Энергик: {answer or '(промолчал)'}")
             self._maybe_digest()
+
+    @staticmethod
+    def _tok(text: str) -> int:
+        return int(len(text) / 2.2) + 4
+
+    def _maybe_compress(self) -> None:
+        """Когда история разрастается, самые старые реплики превращаются в краткое содержание
+        (в фоне). Так Энергик помнит ход длинного разговора, а контекст модели не раздувается."""
+        keep = self.max_turns * 2
+        unfit = (len(self.history) - 1) - self._fit_used     # старые реплики, не попавшие в запрос
+        if len(self.history) <= keep + 8 and unfit < 6:
+            return
+        if len(self.history) > keep + 16:      # сжатие не удалось: просто обрезаем, чтобы не копилось
+            self.history[:] = self.history[-(keep + 8):]
+            return
+        if self._compressing:
+            return
+        old = list(self.history[:8])
+        self._compressing = True
+
+        def work():
+            try:
+                convo = "\n".join(("Босс: " if m["role"] == "user" else "Энергик: ") + m["content"][:300]
+                                   for m in old)
+                prompt = ("Обнови краткое содержание разговора Босса и Энергика. Было: "
+                          f"«{self.summary or 'пока ничего'}». Новые реплики:\n{convo}\n\n"
+                          "Напиши 3-4 коротких предложения: о чём говорили, о чём договорились, какие вопросы "
+                          "остались открытыми. Только то, что реально сказано, без выдумок.")
+                text = self.util.complete([{"role": "user", "content": prompt}],
+                                          temperature=0.2, max_tokens=200)
+                if text and len(text) > 20:
+                    self.summary = text[:700]
+                    if self.history[:8] == old:
+                        del self.history[:8]
+            except Exception as e:
+                print(f"[МОЗГ] не удалось сжать историю: {e}")
+            finally:
+                self._compressing = False
+
+        threading.Thread(target=work, daemon=True).start()
 
     # ---------- приветствие и память ----------
     def greeting(self):

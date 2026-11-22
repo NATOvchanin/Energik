@@ -10,6 +10,7 @@ import time
 
 def sanitize(text: str) -> str:
     """Убираем смайлики, звёздочки и прочий мусор, который нельзя произнести."""
+    text = re.sub(r"\b[\w-]+(?:\.[\w-]+)*\.(?:ru|com|org|net|su|рф|io|tv|me|info|biz|by|kz)\b", " ", text)
     t = re.sub(r"[^А-Яа-яЁёA-Za-z0-9\s.,!?…:;\-—()«»\"'%]", " ", text)
     t = re.sub(r"\s+", " ", t).strip()
     return re.sub(r"\s+([,.!?…:;])", r"\1", t)

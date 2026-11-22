@@ -33,6 +33,26 @@ def gpu_memory() -> str:
         return "не удалось узнать (nvidia-smi недоступен)"
 
 
+def ram_usage() -> str:
+    """Загрузка оперативной памяти Windows без сторонних библиотек."""
+    try:
+        import ctypes
+
+        class MemStatus(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("sullAvailExtendedVirtual", ctypes.c_ulonglong)]
+        s = MemStatus()
+        s.dwLength = ctypes.sizeof(MemStatus)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(s))
+        used = (s.ullTotalPhys - s.ullAvailPhys) / 2 ** 30
+        return f"{s.dwMemoryLoad}% ({used:.1f} из {s.ullTotalPhys / 2 ** 30:.1f} ГБ)"
+    except Exception:
+        return "не удалось узнать"
+
+
 def main() -> None:
     if "--devices" in sys.argv:
         devices.list_devices()
@@ -57,8 +77,10 @@ def main() -> None:
     speaker = Speaker(voice)
     ears = Ears(cfg)
     dialogue.warmup()
-    print(f"[ПАМЯТЬ] заметок в памяти: {mem.count()}")
+    removed = mem.prune()
+    print(f"[ПАМЯТЬ] заметок в памяти: {mem.count()}" + (f" (убрал лишних: {removed})" if removed else ""))
     print(f"\n[ВИДЕОПАМЯТЬ] занято: {gpu_memory()}")
+    print(f"[ОПЕРАТИВКА] занято: {ram_usage()}")
     print("[СОВЕТ] В другой консоли выполни `ollama ps`: в колонке PROCESSOR должно быть 100% GPU.\n")
 
     hello = brain.greeting() or "Босс, Энергик на связи. Что у нас сегодня, очередной провал?"
@@ -67,6 +89,7 @@ def main() -> None:
     ears.flush()
 
     print("Слушаю. Говори в микрофон (Ctrl+C для выхода).\n")
+    replies = 0
     try:
         while True:
             text = ears.listen()
@@ -103,6 +126,9 @@ def main() -> None:
                       f"первый звук: {speaker.first_play_ts - t_heard:.2f} с, "
                       f"предложений: {n}")
             ears.flush()  # не слушаем самого себя
+            replies += 1
+            if replies % 5 == 0:
+                print(f"   [РЕСУРСЫ] видеопамять: {gpu_memory()}, оперативка: {ram_usage()}")
     except KeyboardInterrupt:
         print("\nВыход.")
     finally:
