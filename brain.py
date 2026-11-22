@@ -10,6 +10,7 @@ import time
 import curiosity
 import memory as memlib
 import tools
+from browser import BrowserSession
 from config import ROOT
 
 SENT_END = re.compile(r'[.!?…]+["»)]*\s')
@@ -75,6 +76,7 @@ class Brain:
         self.news = None
         self.t_start = time.time()
         self.turns = 0
+        self.browser = BrowserSession(cfg, ROOT)
 
     # ---------- подготовка контекста ----------
     def reset(self) -> None:
@@ -118,11 +120,12 @@ class Brain:
         minutes = int((time.time() - self.t_start) / 60)
         dur = "меньше минуты" if minutes < 1 else f"{minutes} мин."
         now = time.localtime()
-        caps = ("Что у тебя реально есть: слух (микрофон), голос, память и умение сходить в интернет, "
-                "когда это нужно. Экран ты пока не видишь. Если для ответа нужно было что-то выяснить, "
-                "это делается до твоего ответа и приходит блоком «Результаты поиска». Если такого блока "
-                "нет, значит ты ничего не искал и не открывал: не говори, что смотрел страницы, и "
-                "не выдумывай факты, а честно скажи, что не знаешь. ")
+        caps = ("Что у тебя реально есть: слух (микрофон), голос, память и браузер Chromium. "
+                "Браузер сохраняет текущую вкладку между репликами. Если пришёл блок «Результаты поиска» "
+                "или «Содержимое открытой страницы», опирайся только на него. Не утверждай, что нажимал, "
+                "покупал, отправлял или менял что-либо, если программа явно не сообщила об успешном действии. "
+                "Если страницы не удалось прочитать, честно скажи об этом и не выдавай поисковые выдержки "
+                "за содержимое сайта. ")
         recent = ""
         if self.last_search and 0 < self.turns - self.last_search[0] <= 4:
             _, q, found = self.last_search
@@ -145,12 +148,27 @@ class Brain:
             return None
         if self.news and self.turns - self.news["turn"] <= 3 and tools.is_more_request(user_text):
             return "news", "новости", "продолжение"
+        # Явные команды навигации работают без повторного поиска.
+        if self.browser.is_open:
+            low = user_text.lower().strip(" .!?…")
+            if re.search(r"^(?:назад|вернись назад|предыдущая страница)$", low):
+                return "back", "", "навигация по текущей странице"
+            if re.search(r"^(?:прокрути|листани|листай)\s+(?:вниз|ниже)$", low):
+                return "scroll_down", "", "навигация по текущей странице"
+            if re.search(r"^(?:прокрути|листани|листай)\s+(?:вверх|выше)$", low):
+                return "scroll_up", "", "навигация по текущей странице"
+            m = re.match(r'^(?:открой|перейди по|нажми на)\s+(?:ссылку\s+)?[«"\']?(.+?)[»"\']?$', user_text, re.I)
+            if m and re.search(r"ссылк|перейди по|нажми на", low):
+                return "click", m.group(1).strip(), "переход по ссылке текущей страницы"
         req = tools.parse_search_request(user_text)
         if req:
             return req[0], req[1], "прямая просьба"
         if self.curious:
             t = time.time()
-            d = curiosity.decide(self.util, user_text, self.history[:-1])
+            page_state = None
+            if self.browser.is_open and self.last_search and self.turns - self.last_search[0] <= 8:
+                page_state = f"Открытая вкладка: {self.browser.title} | {self.browser.url}"
+            d = curiosity.decide(self.util, user_text, self.history[:-1], page_state=page_state)
             if d:
                 print(f"[ЛЮБОПЫТСТВО] сам решил выяснить ({time.time() - t:.1f} с): {d[0]} «{d[1]}»")
                 return d[0], d[1], "само"
@@ -174,6 +192,29 @@ class Brain:
         return f"[{it['source']}]{date} {it['title']}. {it['summary']}"[:700], None
 
     def _lookup(self, kind: str, query: str, question: str):
+        if kind in ("back", "scroll_down", "scroll_up", "click"):
+            if kind == "back":
+                page, err = self.browser.back()
+            elif kind == "click":
+                page, err = self.browser.click_link(query)
+            else:
+                page, err = self.browser.scroll("down" if kind == "scroll_down" else "up")
+            if not page:
+                return None, err
+            return f"[{self.browser.url}] {self.browser.title}\n{page[:3500]}", None
+        if kind == "continue":
+            page, err = self.browser.read_current()
+            if not page:
+                return None, err
+            try:
+                facts = self.util.complete([{"role": "user", "content": curiosity.SUMMARIZE_PROMPT.format(
+                    question=question[:300], query=f"текущая страница {self.browser.url}", page=page[:5000])}],
+                    temperature=0.1, max_tokens=220)
+            except Exception as e:
+                return None, f"не удалось разобрать страницу: {str(e)[:120]}"
+            if not facts or facts.strip().upper().startswith("НЕТ"):
+                return None, "на открытой странице не нашёл ответа на этот вопрос"
+            return f"[{self.browser.url}] {facts.strip()}", None
         if kind == "news" and query == "новости":
             found, err = self._next_news()
             if found:
@@ -181,7 +222,7 @@ class Brain:
             print(f"[ИНТЕРНЕТ] ленты недоступны ({err}), пробую поисковик")
             kind = "search"
         return curiosity.research(self.util, "who" if kind == "who" else "search", query,
-                                  question, self.cfg)
+                                  question, self.cfg, browser=self.browser)
 
     # ---------- ответ ----------
     def reply(self, user_text: str):
@@ -326,7 +367,8 @@ class Brain:
         self._digest_thread.start()
 
     def close(self) -> None:
-        """Перед выходом: дописывает дневник и итог разговора."""
+        """Перед выходом: закрывает браузер и дописывает дневник/итог разговора."""
+        self.browser.close()
         if self._digest_thread and self._digest_thread.is_alive():
             self._digest_thread.join(timeout=30)
         lines = self.transcript[self._digested:]

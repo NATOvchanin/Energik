@@ -133,3 +133,11 @@ utility = "ollama"       # служебные запросы; лучше ост�
 base_url = ""            # например адрес OpenAI-совместимого сервиса, заканчивающийся на /v1
 model = ""               # название модели у этого сервиса
 api_key_env = "ENERGIK_API_KEY"
+
+# --- Постоянный браузер Энергика ---
+[browser]
+enabled = true
+headless = false             # false: видно окно Chromium; true: скрытый режим
+profile_dir = "browser_profile"  # отдельный профиль, cookies и состояние сессии сохраняются
+timeout_ms = 15000
+max_chars = 7000
